@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-import torch
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+# Importing the engine pins torch to one CPU thread for these tiny matrices.
 from .engine import ValidationError, evaluate
 from .samples import SAMPLES
-
-# The matrices are small (<=128 tokens, vocab <=4096, dim 16); more threads
-# cost more than they save.  Keep the container's footprint predictable.
-torch.set_num_threads(max(1, int(os.environ.get("TORCH_NUM_THREADS", "4"))))
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"

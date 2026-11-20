@@ -25,7 +25,7 @@ def test_index_and_health():
 
 def test_samples_endpoint_and_each_sample_passes():
     body = client.get("/api/samples").json()
-    assert len(body["samples"]) == len(SAMPLES) == 3
+    assert len(body["samples"]) == len(SAMPLES) == 4
     for sample in body["samples"]:
         resp = client.post("/api/run", json=sample["payload"])
         assert resp.status_code == 200, (sample["id"], resp.text)

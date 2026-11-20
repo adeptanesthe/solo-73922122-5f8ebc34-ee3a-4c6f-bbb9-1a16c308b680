@@ -254,6 +254,9 @@ function render(report) {
     ["拆分：损失不变量", report.split.max_loss_diff, report.checks.split_loss],
     ["拆分：梯度不变量", report.split.max_grad_diff, report.checks.split_grad],
     ["拆分：权重不变量", report.split.max_weight_diff, report.checks.split_weight],
+    ["拆分后 vs 稠密：损失", report.split.max_vs_dense.loss, report.checks.split_vs_dense_loss],
+    ["拆分后 vs 稠密：梯度", report.split.max_vs_dense.grad, report.checks.split_vs_dense_grad],
+    ["拆分后 vs 稠密：权重", report.split.max_vs_dense.weight, report.checks.split_vs_dense_weight],
   ];
   $("checks").innerHTML = rows.map(([label, value, pass]) => `
     <tr><td>${label}</td>
@@ -274,6 +277,14 @@ function render(report) {
     ` ｜ 反向重算：<b class="ok">${m.recompute_in_backward ? "是" : "否"}</b><br>` +
     `跨前向/反向保存的张量：${m.saved_tensor_roles.join("、")}<br>` +
     `各微批保存形状：[${m.saved_shapes_per_microbatch.map((s) => "(" + s.map((x) => x.join("×")).join("), (") + ")").join(" ｜ ")}]`;
+}
+
+function clearResults() {
+  $("summary").innerHTML = "";
+  $("checks").innerHTML = "";
+  $("splits").innerHTML = "";
+  $("memory").textContent = "";
+  $("raw").textContent = "（运行后显示）";
 }
 
 async function run() {
@@ -299,6 +310,7 @@ async function run() {
     $("status").textContent = `完成 · ${body.ok ? "通过" : "未通过"}`;
     $("status").className = "pill " + (body.ok ? "ok" : "bad");
   } catch (e) {
+    clearResults();
     $("error").textContent = "请求失败：" + e.message;
     $("verdict").textContent = "请求被拒绝或失败";
     $("verdict").className = "verdict fail";
@@ -335,6 +347,9 @@ function applySample(sample) {
   $("batches").innerHTML = "";
   sample.payload.microbatches.forEach((mb) => addBatch(mb.name, pairToText(mb.tokens)));
   $("error").textContent = sample.note;
+  $("verdict").textContent = "样例已载入，点击“运行对照”";
+  $("verdict").className = "verdict idle";
+  clearResults();
 }
 
 $("add").addEventListener("click", () => {

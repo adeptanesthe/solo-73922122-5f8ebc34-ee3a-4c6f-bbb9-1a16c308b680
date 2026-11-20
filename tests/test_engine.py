@@ -159,6 +159,109 @@ def test_large_scores_remain_accurate(scale):
         assert report["errors"][key] <= TOLERANCE
 
 
+# ---------------------------------------------------------------------------
+# Regression: the reported large-score case (seed 1587, vocab 4096, scale 100)
+# ---------------------------------------------------------------------------
+REPORTED = {"seed": 1587, "scale": 100.0, "vocab_size": 4096}
+
+
+def _reported(tokens, name="m"):
+    return {**REPORTED, "microbatches": [{"name": name, "tokens": tokens}]}
+
+
+def test_reported_single_valid_token_passes():
+    report = evaluate(_reported([[1931, 3209]]))
+    assert report["ok"], (report["errors"], report["split"])
+    # The old engine was at ~8.5e-9 here, just under the threshold: it passed
+    # by luck of the rounding.  The fixed projection is orders tighter.
+    assert report["errors"]["grad_max_abs_diff"] < 1e-12
+
+
+def test_reported_ignored_neighbours_pass():
+    """-100 rows before/after the only valid token must not perturb it."""
+    report = evaluate(_reported([[1, -100], [2, -100], [1931, 3209],
+                                 [3, -100], [4, -100]]))
+    assert report["ok"], (report["errors"], report["split"])
+    assert report["errors"]["grad_max_abs_diff"] <= TOLERANCE
+    assert report["split"]["max_grad_diff"] <= TOLERANCE
+
+
+def test_reported_four_identical_rows_split_invariance():
+    """Four identical rows used to disagree by ~1.5e-8 once re-split."""
+    report = evaluate(_reported([[1931, 3209]] * 4))
+    assert report["ok"], (report["errors"], report["split"])
+    assert report["errors"]["loss_abs_diff"] <= TOLERANCE
+    assert report["errors"]["grad_max_abs_diff"] <= TOLERANCE
+    assert report["errors"]["weight_max_abs_diff"] <= TOLERANCE
+    for key in ("loss", "grad", "weight"):
+        assert report["split"][f"max_{key}_diff"] <= TOLERANCE
+        assert report["split"]["max_vs_dense"][key] <= TOLERANCE
+    # Every re-split of the same 4 rows must land on the same answer.
+    assert len(report["split"]["runs"]) == 4
+    for run in report["split"]["runs"]:
+        assert run["loss"] == report["chunked"]["loss"]
+
+
+def test_split_runs_checked_against_dense_reference():
+    report = evaluate(_reported([[1931, 3209], [1, -100], [1931, 3209],
+                                 [2, -100], [77, 78]]))
+    assert report["ok"]
+    for check in ("split_vs_dense_loss", "split_vs_dense_grad",
+                  "split_vs_dense_weight"):
+        assert report["checks"][check], report["split"]["max_vs_dense"]
+
+
+@pytest.mark.parametrize(
+    "batches",
+    [
+        [[[1, -100], [2, -100], [1931, 3209]], [[3, -100], [4, -100]]],
+        [[[1931, 3209]], [[1931, 3209]], [[1931, 3209]], [[1931, 3209]]],
+        [[[1931, 3209], [1, -100]], [[2, -100], [1931, 3209]]],
+    ],
+)
+def test_reported_added_rows_and_resplits_agree(batches):
+    report = evaluate(
+        {**REPORTED, "microbatches": [
+            {"name": f"mb{i}", "tokens": toks} for i, toks in enumerate(batches)
+        ]}
+    )
+    assert report["ok"], (report["errors"], report["split"])
+
+
+def test_adding_and_removing_ignored_rows_is_bit_neutral():
+    """Ignored rows may not change effective-token loss/grad/weight at all."""
+    base = evaluate(_reported([[1931, 3209]]))
+    padded = evaluate(_reported([[7, -100], [1931, 3209], [8, -100]]))
+    assert padded["chunked"]["loss"] == base["chunked"]["loss"]
+    assert padded["errors"]["grad_max_abs_diff"] == base["errors"]["grad_max_abs_diff"]
+    spec_a = parse_payload(_reported([[1931, 3209]]))
+    spec_b = parse_payload(_reported([[7, -100], [1931, 3209], [8, -100]]))
+    ga = run_chunked(spec_a).grad
+    gb = run_chunked(spec_b).grad
+    assert torch.equal(ga, gb)
+
+
+def test_projection_is_shape_and_chunk_invariant():
+    """The projection must give the same bits regardless of batching."""
+    import app.engine as engine
+
+    weight = make_weight(4096, 1587, 100.0)
+    rows = torch.tensor([1931, 3209, 0, 4095, 17, 17, 1931, 2048])
+    hidden = weight.index_select(0, rows)
+    full = engine._project(hidden, weight)
+    for n in (1, 2, 3, 5, 8):
+        assert torch.equal(engine._project(hidden[:n], weight), full[:n])
+    for chunk in (16, 64, 128, 256):
+        pieces = torch.cat(
+            [engine._project(hidden, weight[s:s + chunk])
+             for s in range(0, weight.shape[0], chunk)],
+            dim=1,
+        )
+        assert torch.equal(pieces, full)
+    for start, end in engine._chunk_ranges(weight.shape[0]):
+        assert end - start <= MAX_VOCAB_CHUNK
+
+
 def test_duplicate_inputs_accumulate_gradients():
     tokens = [[4, 4], [4, 4], [4, 7], [9, 4]]
     report = evaluate(_payload(tokens, seed=3, vocab=300))
@@ -263,6 +366,28 @@ def test_chunk_axis_never_exceeds_128(monkeypatch):
     spec = parse_payload(_payload([[1, 2], [3, 4]], vocab=4096))
     run_chunked(spec)
     assert widths and max(widths) <= MAX_VOCAB_CHUNK
+
+
+def test_every_projection_temp_has_vocab_axis_at_most_128(monkeypatch):
+    """Watch ``_project`` itself: no call may build a wider vocab axis."""
+    import app.engine as engine
+
+    widths = []
+    real_project = engine._project
+
+    def spy(hidden, weight_chunk):
+        widths.append(int(weight_chunk.shape[0]))
+        return real_project(hidden, weight_chunk)
+
+    monkeypatch.setattr(engine, "_project", spy)
+    spec = parse_payload(_payload(
+        [[1, 4095], [2048, 0], [4095, 4095], [17, IGNORE_INDEX]], vocab=4096
+    ))
+    res = run_chunked(spec)
+    # Forward stats, target logits and the backward loop all go through it.
+    assert widths and max(widths) <= MAX_VOCAB_CHUNK, max(widths)
+    assert len(widths) >= 3 * 32  # 32 chunks over 4096 for each pass
+    assert torch.isfinite(res.grad).all()
 
 
 def test_numeric_loss_equals_manual_formula():

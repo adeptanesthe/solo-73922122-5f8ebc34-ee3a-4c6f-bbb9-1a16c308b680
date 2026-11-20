@@ -17,16 +17,40 @@ Design contract
   provides the ground truth for loss, gradient and post-update weights.
 * Mini-batch splitting is mathematically neutral; the engine verifies it
   empirically for splits into 1..4 micro-batches.
+
+Numerical notes (why the single-step comparison is exact to ~1e-14)
+-------------------------------------------------------------------
+At ``scale=100`` the logits reach ~3e5, i.e. one float64 ulp is ~6e-11.  A
+BLAS GEMM ``h @ W.T`` rounds differently depending on how many rows it is
+handed, so the same token got different last bits when it was the only row of
+a micro-batch versus one of four identical rows.  Feeding those logits into
+``softmax`` amplified the difference to ~1e-8 in the gradient.  Two rules
+remove the shape dependence, and both the chunked engine and the dense
+reference follow them:
+
+1. ``_project`` computes ``h @ W_chunk.T`` as an explicit, fixed-order sum over
+   the 16 embedding dimensions.  The value of a row/column pair does not
+   depend on the batch size or on the vocab chunk it lands in (bitwise).
+2. The softmax normaliser is kept as ``(m, s)`` with ``m = max logit`` and
+   ``s = sum exp(logit - m)``; probabilities are ``exp(z - m) / s`` and the
+   loss uses ``m + log(s) - z_target``.  ``z - lse`` with ``lse ~ 3e5`` would
+   lose accuracy to cancellation, while ``z - m`` is exact by construction.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import threading
 from dataclasses import dataclass, field
 from typing import Iterable, List, Sequence, Tuple
 
 import torch
+
+# The matrices here are tiny (<=128 rows, 16 columns); BLAS/OpenMP thread
+# hand-off dominates and oversubscription makes the projection many times
+# slower.  Pin torch to one thread unless the caller asks otherwise.
+torch.set_num_threads(max(1, int(os.environ.get("TORCH_NUM_THREADS", "1"))))
 
 IGNORE_INDEX = -100
 EMBED_DIM = 16
@@ -204,14 +228,46 @@ def _chunk_ranges(vocab_size: int) -> Iterable[Tuple[int, int]]:
 # ---------------------------------------------------------------------------
 # Chunked numerics helpers (all temps have a vocab axis <= 128)
 # ---------------------------------------------------------------------------
-def _token_logsumexp(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Per-token log-sum-exp over the full vocabulary, chunk by chunk."""
-    lse = torch.full((hidden.shape[0],), -math.inf, dtype=torch.float64)
+def _project(hidden: torch.Tensor, weight_chunk: torch.Tensor) -> torch.Tensor:
+    """``hidden @ weight_chunk.T`` with a fixed summation order.
+
+    A BLAS GEMM rounds differently for different row counts, which made a
+    token that appeared alone in a micro-batch disagree in the last bits with
+    the same token next to duplicates (see the module docstring).  Summing the
+    16 embedding dimensions explicitly in a fixed order makes every
+    ``[row, vocab_index]`` value independent of the batch size and of the
+    chunk it is computed in -- bitwise, not just to some tolerance.
+    """
+    out = hidden[:, 0].unsqueeze(1) * weight_chunk[:, 0].unsqueeze(0)
+    for d in range(1, hidden.shape[1]):
+        out += hidden[:, d].unsqueeze(1) * weight_chunk[:, d].unsqueeze(0)
+    return out
+
+
+def _softmax_stats(
+    hidden: torch.Tensor, weight: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token ``(max logit, sum exp(logit - max))`` over the full vocab.
+
+    Keeping the pair instead of ``logsumexp`` avoids forming ``z - lse`` with
+    ``lse ~ 3e5``, where the subtraction would throw away ~11 bits of the
+    result; ``z - max`` is exact because the maximum is one of the logits.
+    """
+    rows = hidden.shape[0]
+    max_val = torch.full((rows,), -math.inf, dtype=torch.float64)
+    sum_val = torch.zeros((rows,), dtype=torch.float64)
     for start, end in _chunk_ranges(weight.shape[0]):
-        logits = hidden @ weight[start:end].t()  # [N, <=128]
-        lse = torch.logaddexp(lse, torch.logsumexp(logits, dim=1))
+        logits = _project(hidden, weight[start:end])
+        chunk_max = logits.max(dim=1).values
+        new_max = torch.maximum(max_val, chunk_max)
+        # Rescaling the running sum keeps chunk-max jumps from overflowing.
+        sum_val = (
+            sum_val * torch.exp(max_val - new_max)
+            + torch.exp(logits - new_max.unsqueeze(1)).sum(dim=1)
+        )
+        max_val = new_max
         del logits
-    return lse
+    return max_val, sum_val
 
 
 def _target_logits(
@@ -225,7 +281,7 @@ def _target_logits(
         if not bool(sel.any()):
             continue
         rows = torch.nonzero(sel, as_tuple=False).flatten()
-        logits = hidden.index_select(0, rows) @ weight[start:end].t()
+        logits = _project(hidden.index_select(0, rows), weight[start:end])
         cols = target.index_select(0, rows) - start
         picked[rows] = logits.gather(1, cols.unsqueeze(1)).squeeze(1)
         del logits
@@ -249,7 +305,8 @@ class ChunkedSoftmaxLoss(torch.autograd.Function):
     Forward saves ``(W, hidden, target, valid_idx)`` only.  It does *not*
     cache per-chunk logits or probabilities.  Backward recomputes chunk logits
     from the saved hidden states and W, normalises them with a recomputed
-    global log-sum-exp, and accumulates ``dL/dW`` and ``dL/dH`` chunk-wise.
+    global ``(max, sum-exp)`` pair, and accumulates ``dL/dW`` and ``dL/dH``
+    chunk-wise.
     """
 
     @staticmethod
@@ -270,9 +327,10 @@ class ChunkedSoftmaxLoss(torch.autograd.Function):
         h = hidden.index_select(0, valid_idx)
         tgt = target.index_select(0, valid_idx)
 
-        lse = _token_logsumexp(h, weight)
+        max_val, sum_val = _softmax_stats(h, weight)
         target_logit = _target_logits(h, tgt, weight)
-        loss = (lse - target_logit).mean()
+        # -log p(target) = max + log(sum exp(z - max)) - z_target
+        loss = (max_val + torch.log(sum_val) - target_logit).mean()
 
         ctx.save_for_backward(weight, hidden, target, valid_idx)
         ctx.n_valid = n_valid
@@ -288,15 +346,15 @@ class ChunkedSoftmaxLoss(torch.autograd.Function):
         tgt = target.index_select(0, valid_idx)
 
         # Recompute the global normaliser: nothing chunk-wise was cached.
-        lse = _token_logsumexp(h, weight)
+        max_val, sum_val = _softmax_stats(h, weight)
         scale = grad_output / n_valid
 
         grad_weight = torch.zeros_like(weight)
         grad_h = torch.zeros_like(h)
 
         for start, end in _chunk_ranges(weight.shape[0]):
-            logits = h @ weight[start:end].t()  # [N, <=128]
-            probs = torch.exp(logits - lse.unsqueeze(1))
+            logits = _project(h, weight[start:end])  # [N, <=128]
+            probs = torch.exp(logits - max_val.unsqueeze(1)) / sum_val.unsqueeze(1)
             sel = (tgt >= start) & (tgt < end)
             if bool(sel.any()):
                 rows = torch.nonzero(sel, as_tuple=False).flatten()
@@ -322,13 +380,23 @@ def dense_reference(
     input_ids: Sequence[int],
     target_ids: Sequence[int],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Ground truth with a full ``[tokens, vocab]`` score matrix.
+
+    No chunk limit, no hand-written backward: the score tensor, the
+    ``log_softmax`` and the tied-parameter gradient all come from autograd.
+    It still uses :func:`_project`, because both sides must evaluate the same
+    (mathematically identical) projection expression -- otherwise a genuine
+    chunking bug and a shape-dependent BLAS rounding would be
+    indistinguishable.  Chunking and micro-batch splitting are what this
+    reference checks.
+    """
     w = weight.detach().clone().requires_grad_(True)
     idx = torch.tensor(input_ids, dtype=torch.long)
     tgt = torch.tensor(target_ids, dtype=torch.long)
     valid = tgt != IGNORE_INDEX
 
     hidden = w.index_select(0, idx)  # input embedding
-    logits = hidden @ w.t()  # [T, V] full dense scores
+    logits = _project(hidden, w)  # [T, V] full dense scores
     log_probs = torch.log_softmax(logits, dim=1)
     picked = log_probs.gather(1, tgt.clamp_min(0).unsqueeze(1)).squeeze(1)
     loss = -picked[valid].mean()
@@ -505,6 +573,11 @@ def evaluate(payload: dict) -> dict:
         "split_loss": max_split_loss <= TOLERANCE,
         "split_grad": max_split_grad <= TOLERANCE,
         "split_weight": max_split_weight <= TOLERANCE,
+        # Re-split runs must also stay within the documented threshold of the
+        # independent dense reference, not merely of each other.
+        "split_vs_dense_loss": max_split_vs_dense_loss <= TOLERANCE,
+        "split_vs_dense_grad": max_split_vs_dense_grad <= TOLERANCE,
+        "split_vs_dense_weight": max_split_vs_dense_weight <= TOLERANCE,
     }
     passed = all(checks.values())
 
@@ -512,7 +585,7 @@ def evaluate(payload: dict) -> dict:
         "ok": passed,
         "tolerance": TOLERANCE,
         "message": (
-            "通过：三项对照误差与拆分不变量均 <= 1e-8"
+            "通过：三项对照误差、拆分不变量及拆分后与稠密参考的对照均 <= 1e-8"
             if passed
             else "未通过：至少一项误差超过 1e-8"
         ),
